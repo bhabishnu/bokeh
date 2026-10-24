@@ -22,7 +22,13 @@ log = logging.getLogger(__name__)
 
 # Bokeh imports
 from .data_model import DataModel
-from .model import Model
+from .model import (
+    CallbackPolicy,
+    Committed,
+    Debounce,
+    Model,
+    Throttle,
+)
 from .util import Qualified, collect_models, get_class
 
 #-----------------------------------------------------------------------------
@@ -30,9 +36,13 @@ from .util import Qualified, collect_models, get_class
 #-----------------------------------------------------------------------------
 
 __all__ = (
+    'CallbackPolicy',
+    'Committed',
     'DataModel',
+    'Debounce',
     'Model',
     'Qualified',
+    'Throttle',
     'collect_models',
     'get_class',
 )

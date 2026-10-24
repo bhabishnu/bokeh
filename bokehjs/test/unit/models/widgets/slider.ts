@@ -5,6 +5,7 @@ import {Slider, RangeSlider, DateSlider, DateRangeSlider, DatetimeRangeSlider} f
 import {CustomJSTickFormatter} from "@bokehjs/models/formatters"
 import {isInteger} from "@bokehjs/core/util/types"
 import {build_view} from "@bokehjs/core/build_views"
+import {ModelChangedEvent} from "@bokehjs/document"
 
 describe("SliderView", () => {
 
@@ -16,6 +17,31 @@ describe("SliderView", () => {
     const r = sv._calc_from([5.0])
     expect(r).to.be.equal(5)
     expect(isInteger(r)).to.be.true
+  })
+
+  it("should defer a committed callback until the value change completes", async () => {
+    const subscribed_changes = new Map([["value", [["committed", null] as ["committed", null]]]])
+    const updates: string[] = []
+    const slider = Slider.create({
+      start: 0, end: 10, step: 1, value: 0, subscribed_changes,
+    })
+    const {view} = await display(slider, null)
+    const document = slider.document!
+
+    document.on_change((event) => {
+      if (event instanceof ModelChangedEvent) {
+        const state = document.is_sync_deferred(slider, event.attr) ? "deferred" : "immediate"
+        updates.push(`${state}:${event.attr}`)
+      }
+    })
+    document.sync_flush.connect(({attr}) => updates.push(`flush:${attr}`))
+
+    /* @ts-ignore */
+    view._begin_change()
+    /* @ts-ignore */
+    view._change([5])
+
+    expect(updates).to.be.equal(["deferred:value", "flush:value"])
   })
 })
 
@@ -34,15 +60,13 @@ describe("Slider", () => {
   })
 
   describe("bounds", () => {
-    // Python always sends `value_throttled` equal to `value`, so do the same here
     const make = (attrs: {start?: number, end?: number, value?: number}) => {
-      return Slider.create({step: 1, ...attrs, ...(attrs.value != null ? {value_throttled: attrs.value} : {})})
+      return Slider.create({step: 1, ...attrs})
     }
 
     function count_changes(slider: Slider): () => number {
       let n = 0
       slider.connect(slider.properties.value.change, () => n++)
-      slider.connect(slider.properties.value_throttled.change, () => n++)
       return () => n
     }
 
@@ -58,7 +82,6 @@ describe("Slider", () => {
         it(`should turn value=${value} into ${expected} for [${start}, ${end}]`, () => {
           const slider = make({start, end, value})
           expect(slider.value).to.be.equal(expected)
-          expect(slider.value_throttled).to.be.equal(expected)
         })
       }
 
@@ -75,39 +98,16 @@ describe("Slider", () => {
     })
 
     describe("when start or end change", () => {
-      it("should clamp value and value_throttled when start moves past them", () => {
+      it("should clamp value when start moves past it", () => {
         const slider = make({start: 0, end: 10, value: 4})
         slider.start = 5
         expect(slider.value).to.be.equal(5)
-        expect(slider.value_throttled).to.be.equal(5)
       })
 
-      it("should clamp value and value_throttled when end moves past them", () => {
+      it("should clamp value when end moves past it", () => {
         const slider = make({start: 0, end: 10, value: 8})
         slider.end = 7
         expect(slider.value).to.be.equal(7)
-        expect(slider.value_throttled).to.be.equal(7)
-      })
-
-      it("should clamp value_throttled when only it is out of bounds", () => {
-        const slider = make({start: 0, end: 10, value: 6})
-        slider.setv({value_throttled: 9})
-        slider.end = 7
-        expect(slider.value).to.be.equal(6)
-        expect(slider.value_throttled).to.be.equal(7)
-
-        slider.setv({value_throttled: 1})
-        slider.start = 3
-        expect(slider.value).to.be.equal(6)
-        expect(slider.value_throttled).to.be.equal(3)
-      })
-
-      it("should clamp value when only it is out of bounds, leaving value_throttled alone", () => {
-        const slider = make({start: 0, end: 10, value: 9})
-        slider.setv({value_throttled: 6})
-        slider.end = 7
-        expect(slider.value).to.be.equal(7)
-        expect(slider.value_throttled).to.be.equal(6)
       })
 
       it("should not touch value when the range is widened or still contains it", () => {
@@ -118,7 +118,6 @@ describe("Slider", () => {
         slider.start = 5 // value sits exactly on the new bound
         slider.end = 5
         expect(slider.value).to.be.equal(5)
-        expect(slider.value_throttled).to.be.equal(5)
         expect(changes()).to.be.equal(0)
       })
 
@@ -126,11 +125,9 @@ describe("Slider", () => {
         const slider = make({start: 0, end: 10, value: 2})
         slider.setv({start: 6, end: 8})
         expect(slider.value).to.be.equal(6)
-        expect(slider.value_throttled).to.be.equal(6)
 
         slider.setv({start: 0, end: 4})
         expect(slider.value).to.be.equal(4)
-        expect(slider.value_throttled).to.be.equal(4)
       })
 
       it("should enforce bounds once value is set after partial initialization", () => {
@@ -150,16 +147,6 @@ describe("Slider", () => {
         })
         slider.end = 7
         expect(seen).to.be.equal([{start: 0, end: 7, value: 7}])
-      })
-
-      it("should see the new bound when notified of a value_throttled change", () => {
-        const slider = make({start: 0, end: 10, value: 8})
-        const seen: {end: number, value_throttled: number}[] = []
-        slider.connect(slider.properties.value_throttled.change, () => {
-          seen.push({end: slider.end, value_throttled: slider.value_throttled})
-        })
-        slider.end = 7
-        expect(seen).to.be.equal([{end: 7, value_throttled: 7}])
       })
 
       it("should see an already clamped value when notified of a bound change", async () => {
@@ -208,16 +195,13 @@ describe("RangeSlider", () => {
   describe("bounds", () => {
     type Range = [number, number]
 
-    // Python always sends `value_throttled` equal to `value`, so do the same here
     const make = (attrs: {start?: number, end?: number, value?: Range}) => {
-      const {value} = attrs
-      return RangeSlider.create({step: 1, ...attrs, ...(value != null ? {value_throttled: [...value] as Range} : {})})
+      return RangeSlider.create({step: 1, ...attrs})
     }
 
     function count_changes(slider: RangeSlider): () => number {
       let n = 0
       slider.connect(slider.properties.value.change, () => n++)
-      slider.connect(slider.properties.value_throttled.change, () => n++)
       return () => n
     }
 
@@ -235,7 +219,6 @@ describe("RangeSlider", () => {
         it(`should turn value=[${value}] into [${expected}] for [${start}, ${end}]`, () => {
           const slider = make({start, end, value})
           expect(slider.value).to.be.equal(expected)
-          expect(slider.value_throttled).to.be.equal(expected)
         })
       }
 
@@ -257,13 +240,6 @@ describe("RangeSlider", () => {
         expect(slider.value).to.be.equal([5, 7])
       })
 
-      it("should keep value_throttled inside range bounds", () => {
-        const slider = make({start: 0, end: 10, value: [4, 8]})
-        slider.start = 5
-        slider.end = 7
-        expect(slider.value_throttled).to.be.equal([5, 7])
-      })
-
       it("should only move the handle that is out of bounds", () => {
         const slider = make({start: 0, end: 10, value: [4, 6]})
         slider.start = 5
@@ -280,26 +256,6 @@ describe("RangeSlider", () => {
         expect(slider.value).to.be.equal([4.5, 4.5])
       })
 
-      it("should clamp value_throttled when only it is out of bounds", () => {
-        const slider = make({start: 0, end: 10, value: [4, 6]})
-        slider.setv({value_throttled: [2, 8]})
-        slider.end = 7
-        expect(slider.value).to.be.equal([4, 6])
-        expect(slider.value_throttled).to.be.equal([2, 7])
-
-        slider.start = 3
-        expect(slider.value).to.be.equal([4, 6])
-        expect(slider.value_throttled).to.be.equal([3, 7])
-      })
-
-      it("should clamp value when only it is out of bounds, leaving value_throttled alone", () => {
-        const slider = make({start: 0, end: 10, value: [4, 9]})
-        slider.setv({value_throttled: [4, 6]})
-        slider.end = 7
-        expect(slider.value).to.be.equal([4, 7])
-        expect(slider.value_throttled).to.be.equal([4, 6])
-      })
-
       it("should not touch value when the range is widened or still contains it", () => {
         const slider = make({start: 2, end: 8, value: [4, 6]})
         const changes = count_changes(slider)
@@ -308,7 +264,6 @@ describe("RangeSlider", () => {
         slider.start = 4 // handles sit exactly on the new bounds
         slider.end = 6
         expect(slider.value).to.be.equal([4, 6])
-        expect(slider.value_throttled).to.be.equal([4, 6])
         expect(changes()).to.be.equal(0)
       })
 
@@ -316,16 +271,6 @@ describe("RangeSlider", () => {
         const slider = make({start: 0, end: 10, value: [1, 9]})
         slider.setv({start: 3, end: 7})
         expect(slider.value).to.be.equal([3, 7])
-        expect(slider.value_throttled).to.be.equal([3, 7])
-      })
-
-      it("should not alias value and value_throttled", () => {
-        // without `value_throttled`, as when created from JavaScript only
-        const slider = RangeSlider.create({start: 0, end: 10, step: 1, value: [4, 8]})
-        slider.end = 7
-        expect(slider.value).to.be.equal([4, 7])
-        expect(slider.value_throttled).to.be.equal([4, 7])
-        expect(slider.value).to.not.be.identical(slider.value_throttled)
       })
 
       it("should enforce bounds once value is set after partial initialization", () => {
@@ -345,16 +290,6 @@ describe("RangeSlider", () => {
         })
         slider.end = 7
         expect(seen).to.be.equal([{start: 0, end: 7, value: [4, 7]}])
-      })
-
-      it("should see the new bound when notified of a value_throttled change", () => {
-        const slider = make({start: 0, end: 10, value: [4, 8]})
-        const seen: {end: number, value_throttled: Range}[] = []
-        slider.connect(slider.properties.value_throttled.change, () => {
-          seen.push({end: slider.end, value_throttled: slider.value_throttled})
-        })
-        slider.end = 7
-        expect(seen).to.be.equal([{end: 7, value_throttled: [4, 7]}])
       })
 
       it("should see an already clamped value when notified of a bound change", async () => {

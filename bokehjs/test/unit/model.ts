@@ -3,7 +3,10 @@ import * as sinon from "sinon"
 
 import {CustomJS} from "@bokehjs/models/callbacks/customjs"
 import {Model} from "@bokehjs/model"
+import type {CallbackPolicy} from "@bokehjs/model"
 import type * as p from "@bokehjs/core/properties"
+import {delay} from "@bokehjs/core/util/defer"
+import {Document} from "@bokehjs/document"
 
 namespace Some0Model {
   export type Attrs = p.AttrsOf<Props>
@@ -106,6 +109,174 @@ describe("Model objects", () => {
       expect(spy.called).to.be.false
       m.baz = 10
       expect(spy.callCount).to.be.equal(0)
+    })
+
+    it("should throttle with leading and trailing callbacks", async () => {
+      const callback = CustomJS.create({code: ""})
+      const values: number[] = []
+      sinon.stub(callback, "execute").callsFake(async (model) => {
+        values.push((model as Some0Model).baz)
+      })
+      const js_property_callback_policies = new Map([
+        ["change:baz", new Map([[callback.id, [["throttle", 40] as CallbackPolicy]]])],
+      ])
+      const m = Some0Model.create({
+        js_property_callback_policies,
+        js_property_callbacks: {"change:baz": [callback]},
+      })
+
+      m.baz = 2
+      m.baz = 3
+      m.baz = 4
+
+      expect(values).to.be.equal([2])
+      await delay(70)
+      expect(values).to.be.equal([2, 4])
+    })
+
+    it("should debounce callbacks until changes settle", async () => {
+      const callback = CustomJS.create({code: ""})
+      const values: number[] = []
+      sinon.stub(callback, "execute").callsFake(async (model) => {
+        values.push((model as Some0Model).baz)
+      })
+      const js_property_callback_policies = new Map([
+        ["change:baz", new Map([[callback.id, [["debounce", 40] as CallbackPolicy]]])],
+      ])
+      const m = Some0Model.create({
+        js_property_callback_policies,
+        js_property_callbacks: {"change:baz": [callback]},
+      })
+
+      m.baz = 2
+      await delay(15)
+      m.baz = 3
+
+      expect(values).to.be.equal([])
+      await delay(70)
+      expect(values).to.be.equal([3])
+    })
+
+    it("should defer committed callbacks during an interaction", () => {
+      const callback = CustomJS.create({code: ""})
+      const values: number[] = []
+      sinon.stub(callback, "execute").callsFake(async (model) => {
+        values.push((model as Some0Model).baz)
+      })
+      const js_property_callback_policies = new Map([
+        ["change:baz", new Map([[callback.id, [["committed", null] as CallbackPolicy]]])],
+      ])
+      const m = Some0Model.create({
+        js_property_callback_policies,
+        js_property_callbacks: {"change:baz": [callback]},
+      })
+      const document = new Document({roots: [m]})
+
+      m.baz = 2
+      document.begin_sync_deferral(m, "baz")
+      m.baz = 3
+      m.baz = 4
+
+      expect(values).to.be.equal([2])
+      document.request_sync_flush(m, "baz")
+      expect(values).to.be.equal([2, 4])
+    })
+
+    it("should apply different policies to callbacks on the same property", () => {
+      const immediate = CustomJS.create({code: ""})
+      const committed = CustomJS.create({code: ""})
+      const values: string[] = []
+      sinon.stub(immediate, "execute").callsFake(async (model) => {
+        values.push(`immediate:${(model as Some0Model).baz}`)
+      })
+      sinon.stub(committed, "execute").callsFake(async (model) => {
+        values.push(`committed:${(model as Some0Model).baz}`)
+      })
+      const js_property_callback_policies = new Map([
+        ["change:baz", new Map([[committed.id, [["committed", null] as CallbackPolicy]]])],
+      ])
+      const m = Some0Model.create({
+        js_property_callback_policies,
+        js_property_callbacks: {"change:baz": [immediate, committed]},
+      })
+      const document = new Document({roots: [m]})
+
+      document.begin_sync_deferral(m, "baz")
+      m.baz = 2
+      m.baz = 3
+
+      expect(values).to.be.equal(["immediate:2", "immediate:3"])
+      document.request_sync_flush(m, "baz")
+      expect(values).to.be.equal(["immediate:2", "immediate:3", "committed:3"])
+    })
+
+    it("should apply different policies to the same callback", () => {
+      const callback = CustomJS.create({code: ""})
+      const values: number[] = []
+      sinon.stub(callback, "execute").callsFake(async (model) => {
+        values.push((model as Some0Model).baz)
+      })
+      const js_property_callback_policies = new Map([
+        ["change:baz", new Map([[callback.id, [
+          ["immediate", null] as CallbackPolicy,
+          ["committed", null] as CallbackPolicy,
+        ]]])],
+      ])
+      const m = Some0Model.create({
+        js_property_callback_policies,
+        js_property_callbacks: {"change:baz": [callback]},
+      })
+      const document = new Document({roots: [m]})
+
+      document.begin_sync_deferral(m, "baz")
+      m.baz = 2
+      m.baz = 3
+
+      expect(values).to.be.equal([2, 3])
+      document.request_sync_flush(m, "baz")
+      expect(values).to.be.equal([2, 3, 3])
+    })
+
+    it("should flush a pending callback when its policy is removed", () => {
+      const callback = CustomJS.create({code: ""})
+      const values: number[] = []
+      sinon.stub(callback, "execute").callsFake(async (model) => {
+        values.push((model as Some0Model).baz)
+      })
+      const js_property_callback_policies = new Map([
+        ["change:baz", new Map([[callback.id, [["debounce", 1000] as CallbackPolicy]]])],
+      ])
+      const m = Some0Model.create({
+        js_property_callback_policies,
+        js_property_callbacks: {"change:baz": [callback]},
+      })
+
+      m.baz = 2
+      expect(values).to.be.equal([])
+      m.js_property_callback_policies = new Map()
+      expect(values).to.be.equal([2])
+    })
+
+    it("should debounce server-originated changes as well", async () => {
+      const callback = CustomJS.create({code: ""})
+      const values: number[] = []
+      sinon.stub(callback, "execute").callsFake(async (model) => {
+        values.push((model as Some0Model).baz)
+      })
+      const js_property_callback_policies = new Map([
+        ["change:baz", new Map([[callback.id, [["debounce", 40] as CallbackPolicy]]])],
+      ])
+      const m = Some0Model.create({
+        js_property_callback_policies,
+        js_property_callbacks: {"change:baz": [callback]},
+      })
+
+      m.baz = 2
+      m.setv({baz: 8}, {sync: false})
+
+      expect(values).to.be.equal([])
+      await delay(70)
+      expect(values).to.be.equal([8])
     })
   })
 

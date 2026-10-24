@@ -58,7 +58,10 @@ BACKGROUND_HATCH = [f"background_{name}" for name in HATCH]
 
 ANGLE = ["angle", "angle_units"]
 
-PROPS = ["name", "tags", "js_property_callbacks", "js_event_callbacks", "subscribed_events", "syncable"]
+PROPS = [
+    "name", "tags", "js_property_callbacks", "js_property_callback_policies",
+    "js_event_callbacks", "subscribed_events", "subscribed_changes", "syncable",
+]
 GLYPH = ["decorations"]
 
 MARKER = ["x", "y", "size", "angle", "angle_units", "hit_dilation"]

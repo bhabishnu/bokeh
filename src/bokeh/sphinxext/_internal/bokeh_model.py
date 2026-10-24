@@ -197,7 +197,9 @@ def setup(app: Any) -> SphinxParallelSpec:
 
 _DEFAULT_EXCLUDED_MEMBERS = frozenset({
     "js_event_callbacks",
+    "js_property_callback_policies",
     "js_property_callbacks",
+    "subscribed_changes",
     "subscribed_events",
 })
 

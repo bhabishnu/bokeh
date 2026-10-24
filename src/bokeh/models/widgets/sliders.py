@@ -25,13 +25,13 @@ log = logging.getLogger(__name__)
 # Standard library imports
 import numbers
 from datetime import UTC, date, datetime
+from typing import Any
 
 # Bokeh imports
 from ...core.has_props import abstract
 from ...core.property.color import Color
 from ...core.property.container import Seq, Tuple
 from ...core.property.datetime import Datetime
-from ...core.property.descriptors import UnsetValueError
 from ...core.property.either import Either
 from ...core.property.enum import Enum
 from ...core.property.instance import Instance
@@ -43,9 +43,7 @@ from ...core.property.primitive import (
     Int,
     String,
 )
-from ...core.property.readonly import Readonly
 from ...core.property.required import Required
-from ...core.property.singletons import Undefined
 from ...core.property.string import MathString
 from ...core.validation import error
 from ...core.validation.errors import EQUAL_SLIDER_START_END
@@ -74,27 +72,14 @@ __all__ = (
 class AbstractSlider(Widget):
     """ """
 
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
+    _committed_callback_properties = frozenset({"value"})
 
-        try:
-            # synchronize the value of a readonly property `value_throttled`
-            self.lookup("value_throttled")._set(self, Undefined, self.value)
-        except UnsetValueError:
-            pass
-        except AttributeError:
-            # TODO Remove this when proper support for property overrides is
-            # implemented. For now this is required to make defaults' tests
-            # work, because we depend there on model instances to provide
-            # "default" values.
-            pass
+    # explicit __init__ to support Init signatures
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
 
     # TODO value = Required(GenericType, help="""
     # Initial or selected range.
-    # """)
-
-    # TODO value_throttled = Readonly(GenericType, help="""
-    # Initial or selected value, throttled according to report only on mouseup.
     # """)
 
     orientation = Enum("horizontal", "vertical", help="""
@@ -149,10 +134,6 @@ class CategoricalSlider(AbstractSlider):
     Initial or selected value.
     """)
 
-    value_throttled = Readonly(Required(String), help="""
-    Initial or throttled selected value.
-    """)
-
 class Slider(NumericalSlider):
     """ Slider-based number selection widget. """
 
@@ -168,10 +149,6 @@ class Slider(NumericalSlider):
     Initial or selected value.
     """)
 
-    value_throttled = Readonly(Required(Float), help="""
-    Initial or selected value, throttled according to report only on mouseup.
-    """)
-
     step = Float(default=1, help="""
     The step between consecutive values.
     """)
@@ -183,10 +160,6 @@ class RangeSlider(NumericalSlider):
 
     value = Required(Tuple(Float, Float), help="""
     Initial or selected range.
-    """)
-
-    value_throttled = Readonly(Required(Tuple(Float, Float)), help="""
-    Initial or selected value, throttled according to report only on mouseup.
     """)
 
     start = Required(Float, help="""
@@ -237,10 +210,6 @@ class DateSlider(NumericalSlider):
 
     value = Required(Datetime, help="""
     Initial or selected value.
-    """)
-
-    value_throttled = Readonly(Required(Datetime), help="""
-    Initial or selected value, throttled to report only on mouseup.
     """)
 
     start = Required(Datetime, help="""
@@ -306,10 +275,6 @@ class DateRangeSlider(NumericalSlider):
     Initial or selected range.
     """)
 
-    value_throttled = Readonly(Required(Tuple(Datetime, Datetime)), help="""
-    Initial or selected value, throttled to report only on mouseup.
-    """)
-
     start = Required(Datetime, help="""
     The minimum allowable value.
     """)
@@ -347,10 +312,6 @@ class DatetimeRangeSlider(NumericalSlider):
 
     value = Required(Tuple(Datetime, Datetime), help="""
     Initial or selected range.
-    """)
-
-    value_throttled = Readonly(Required(Tuple(Datetime, Datetime)), help="""
-    Initial or selected value, throttled to report only on mouseup.
     """)
 
     start = Required(Datetime, help="""

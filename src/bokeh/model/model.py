@@ -23,16 +23,21 @@ log = logging.getLogger(__name__)
 #-----------------------------------------------------------------------------
 
 # Standard library imports
+from dataclasses import dataclass
 from inspect import (
     Parameter,
     Signature,
     isclass,
     signature,
 )
+from math import isfinite
+from numbers import Real
 from typing import (
     TYPE_CHECKING,
     Any,
+    ClassVar,
     Iterable,
+    Literal,
     Self,
 )
 
@@ -40,10 +45,24 @@ from typing import (
 from ..core.has_props import HasProps, _default_resolver, abstract
 from ..core.property._sphinx import type_link
 from ..core.property.any import AnyRef
-from ..core.property.container import Dict, List, Set
+from ..core.property.container import (
+    Dict,
+    List,
+    Set,
+    Tuple,
+)
+from ..core.property.descriptors import ColumnDataPropertyDescriptor
+from ..core.property.either import Either
+from ..core.property.enum import Enum
 from ..core.property.instance import Instance
 from ..core.property.nullable import Nullable
-from ..core.property.primitive import Bool, String
+from ..core.property.numeric import Positive
+from ..core.property.primitive import (
+    Bool,
+    Float,
+    Null,
+    String,
+)
 from ..core.property.validation import without_property_validation
 from ..core.serialization import ObjectRefRep, Ref, Serializer
 from ..events import Event
@@ -75,16 +94,123 @@ if TYPE_CHECKING:
 #-----------------------------------------------------------------------------
 
 __all__ = (
+    'CallbackPolicy',
+    'Committed',
+    'Debounce',
     'Model',
+    'Throttle',
 )
 
 #-----------------------------------------------------------------------------
 # General API
 #-----------------------------------------------------------------------------
 
+def _validate_callback_wait(wait: float) -> None:
+    if isinstance(wait, bool) or not isinstance(wait, Real) or not isfinite(wait) or wait <= 0:
+        raise ValueError("callback policy wait must be a finite positive number")
+
+@dataclass(frozen=True, slots=True)
+class Throttle:
+    ''' Deliver changes at a limited rate, including the final value.
+
+    The first change is delivered immediately. While changes continue, the
+    latest value is delivered at most once per interval. The final value is
+    always delivered.
+
+    Args:
+        wait: Minimum interval between callbacks, in milliseconds.
+
+    '''
+
+    wait: float
+
+    def __post_init__(self) -> None:
+        _validate_callback_wait(self.wait)
+
+@dataclass(frozen=True, slots=True)
+class Debounce:
+    ''' Deliver only the final property change after changes stop.
+
+    Each change restarts the timer. The latest value is delivered once no
+    further changes arrive during the interval.
+
+    Args:
+        wait: Quiet interval before the callback, in milliseconds.
+
+    '''
+
+    wait: float
+
+    def __post_init__(self) -> None:
+        _validate_callback_wait(self.wait)
+
+@dataclass(frozen=True, slots=True)
+class Committed:
+    ''' Deliver the final property change when an active interaction finishes. '''
+
+type CallbackPolicy = Throttle | Debounce | Committed
+type _CallbackPolicy = tuple[Literal["immediate", "committed"], None] | tuple[Literal["throttle", "debounce"], float]
+
 #-----------------------------------------------------------------------------
 # Dev API
 #-----------------------------------------------------------------------------
+
+_IMMEDIATE_POLICY: _CallbackPolicy = ("immediate", None)
+
+def _validate_callback_policy(model: Model, attr: str, mode: str) -> None:
+    descriptor = model.lookup(attr)
+
+    if isinstance(descriptor, ColumnDataPropertyDescriptor):
+        raise ValueError(
+            f"callback policies are not supported for column data property {descriptor.name!r}",
+        )
+
+    if descriptor.has_ref:
+        raise ValueError(
+            f"callback policies are not supported for properties containing Bokeh models: {descriptor.name!r}",
+        )
+
+    if mode == "committed" and descriptor.name not in model._committed_callback_properties:
+        raise ValueError(
+            f"committed callbacks are not supported for property {descriptor.name!r} "
+            f"of {model.__class__.__name__}",
+        )
+
+def _validate_subscribed_changes(model: Model, changes: dict[str, list[tuple[str, float | None]]]) -> bool:
+    for attr, policies in changes.items():
+        for mode, _ in policies:
+            if mode != "immediate":
+                _validate_callback_policy(model, attr, mode)
+    return True
+
+def _validate_js_callback_policies(model: Model,
+        events: dict[str, dict[str, list[tuple[str, float | None]]]]) -> bool:
+    for event, policies in events.items():
+        if not event.startswith("change:"):
+            return False
+        attr = event.removeprefix("change:")
+        for callback_policies in policies.values():
+            for mode, _ in callback_policies:
+                if mode != "immediate":
+                    _validate_callback_policy(model, attr, mode)
+    return True
+
+def _callback_policy(model: Model, attr: str, policy: CallbackPolicy | None) -> _CallbackPolicy:
+    if policy is None:
+        return _IMMEDIATE_POLICY
+    if isinstance(policy, Committed):
+        _validate_callback_policy(model, attr, "committed")
+        return ("committed", None)
+    elif isinstance(policy, Throttle):
+        mode, wait = "throttle", policy.wait
+    elif isinstance(policy, Debounce):
+        mode, wait = "debounce", policy.wait
+    else:
+        raise ValueError(
+            "'policy' must be a Throttle, Debounce, or Committed value",
+        )
+    _validate_callback_policy(model, attr, mode)
+    return (mode, wait)
 
 @abstract
 class Model(HasProps, HasDocumentRef, PropertyCallbackManager, EventCallbackManager):
@@ -93,11 +219,18 @@ class Model(HasProps, HasDocumentRef, PropertyCallbackManager, EventCallbackMana
     '''
 
 
+    _committed_callback_properties: ClassVar[frozenset[str]] = frozenset()
+
     # a canonical order for positional args that can be
     # used for any functions derived from this class
     _args = ()
 
     _extra_kws = {}
+
+    _callback_policies: dict[str, list[tuple[PropertyCallback, _CallbackPolicy]]]
+    _callback_policy_values: dict[tuple[str, _CallbackPolicy], Any]
+    _incoming_callback_policy: tuple[str, _CallbackPolicy, Any] | None
+    _incoming_callback_dispatched: bool
 
     @classmethod
     def __init_subclass__(cls, **kwargs: Any) -> None:
@@ -173,6 +306,13 @@ class Model(HasProps, HasDocumentRef, PropertyCallbackManager, EventCallbackMana
 
     def __new__(cls, *args: Any, id: ID | None = None, **kwargs: Any) -> Self:
         obj = super().__new__(cls)
+
+        # Deserialization deliberately bypasses Model.__init__, so initialize
+        # runtime-only callback state while allocating every model instance.
+        obj._callback_policies = {}
+        obj._callback_policy_values = {}
+        obj._incoming_callback_policy = None
+        obj._incoming_callback_dispatched = False
 
         # Setting 'id' implies deferred initialization, which means properties
         # will be initialized in a separate step by a deserializer, etc.
@@ -282,11 +422,42 @@ class Model(HasProps, HasDocumentRef, PropertyCallbackManager, EventCallbackMana
 
     """)
 
+    js_property_callback_policies = Dict(
+        String,
+        Dict(
+            String,
+            List(
+                Either(
+                    Tuple(Enum("immediate", "committed"), Null),
+                    Tuple(Enum("throttle", "debounce"), Positive(Float)),
+                ),
+            ),
+        ),
+        help="""
+    Policies for callbacks in ``js_property_callbacks``, keyed by event and
+    callback ID. This mapping is maintained by ``Model.js_on_change``.
+    """,
+    ).asserts(_validate_js_callback_policies, "invalid JavaScript callback policy")
+
     subscribed_events = Set(String, help="""
     Collection of events that are subscribed to by Python callbacks. This is
     the set of events that will be communicated from BokehJS back to Python
     for this model.
     """)
+
+    subscribed_changes: dict[str, list[tuple[str, float | None]]] = Dict(
+        String,
+        List(
+            Either(
+                Tuple(Enum("immediate", "committed"), Null),
+                Tuple(Enum("throttle", "debounce"), Positive(Float)),
+            ),
+        ),
+        help="""
+    Property change streams that are subscribed to by Python callbacks. This
+    mapping is maintained by ``Model.on_change`` and communicated to BokehJS.
+    """,
+    ).asserts(_validate_subscribed_changes, "invalid subscribed change policy")
 
     syncable: bool = Bool(default=True, help="""
     Indicates whether this model should be synchronized back to a Bokeh server when
@@ -360,7 +531,13 @@ class Model(HasProps, HasDocumentRef, PropertyCallbackManager, EventCallbackMana
             arg_params.insert(0, (param, typ, descriptor.__doc__))
 
         # these are not really useful, and should also really be private, just skip them
-        omissions = {'js_event_callbacks', 'js_property_callbacks', 'subscribed_events'}
+        omissions = {
+            'js_event_callbacks',
+            'js_property_callback_policies',
+            'js_property_callbacks',
+            'subscribed_changes',
+            'subscribed_events',
+        }
 
         kwarg_params = []
 
@@ -495,7 +672,8 @@ class Model(HasProps, HasDocumentRef, PropertyCallbackManager, EventCallbackMana
 
         self.js_on_change(attr, cb)
 
-    def js_on_change(self, event: str, *callbacks: JSChangeCallback) -> None:
+    def js_on_change(self, event: str, *callbacks: JSChangeCallback,
+            policy: CallbackPolicy | None = None) -> None:
         ''' Attach a :class:`~bokeh.models.CustomJS` callback to an arbitrary
         BokehJS model event.
 
@@ -519,6 +697,13 @@ class Model(HasProps, HasDocumentRef, PropertyCallbackManager, EventCallbackMana
 
             source.js_on_change('streaming', callback)
 
+        Property callbacks can be given one delivery policy. For example,
+        ``policy=Throttle(100)`` uses a 100 millisecond interval, while
+        ``policy=Committed()`` defers supported widget properties until the
+        active interaction finishes. Omitting ``policy`` preserves immediate
+        callback delivery. The same callback can be registered again with a
+        different policy.
+
         '''
         if len(callbacks) == 0:
             raise ValueError("js_on_change takes an event name and one or more callbacks, got only one parameter")
@@ -531,17 +716,42 @@ class Model(HasProps, HasDocumentRef, PropertyCallbackManager, EventCallbackMana
         descriptor = self.lookup(event, raises=False)
         if descriptor is not None:
             event = f"change:{descriptor.name}"
+        elif event.startswith("change:"):
+            descriptor = self.lookup(event.removeprefix("change:"), raises=False)
+
+        if descriptor is None:
+            if policy is not None:
+                raise ValueError("callback policies can only be used with property change events")
+            policy = _IMMEDIATE_POLICY
+        else:
+            policy = _callback_policy(self, descriptor.name, policy)
 
         old = {k: [cb for cb in cbs] for k, cbs in self.js_property_callbacks.items()}
+        callback_policies = {
+            name: {callback_id: list(registered) for callback_id, registered in policies.items()}
+            for name, policies in self.js_property_callback_policies.items()
+        }
+        event_policies = callback_policies.setdefault(event, {})
         if event not in self.js_property_callbacks:
             self.js_property_callbacks[event] = []
         for callback in callbacks:
-            if callback in self.js_property_callbacks[event]:
-                continue
-            self.js_property_callbacks[event].append(callback)
+            existing = callback in self.js_property_callbacks[event]
+            if not existing:
+                self.js_property_callbacks[event].append(callback)
+            policies = event_policies.get(callback.id, [_IMMEDIATE_POLICY] if existing else [])
+            if policy not in policies:
+                policies.append(policy)
+            if policies == [_IMMEDIATE_POLICY]:
+                event_policies.pop(callback.id, None)
+            else:
+                event_policies[callback.id] = policies
+        if not event_policies:
+            callback_policies.pop(event, None)
+        self.js_property_callback_policies = callback_policies
         self.trigger('js_property_callbacks', old, self.js_property_callbacks)
 
-    def on_change(self, attr: str, *callbacks: PropertyCallback) -> None:
+    def on_change(self, attr: str, *callbacks: PropertyCallback,
+            policy: CallbackPolicy | None = None) -> None:
         ''' Add a callback on this object to trigger when ``attr`` changes.
 
         Args:
@@ -557,6 +767,13 @@ class Model(HasProps, HasDocumentRef, PropertyCallbackManager, EventCallbackMana
 
                 widget.on_change('value', callback1, callback2, ..., callback_n)
 
+                widget.on_change('value', update_preview, policy=Throttle(100))
+                widget.on_change('value', expensive_update, policy=Committed())
+
+        Throttle and debounce intervals are in milliseconds. The policy applies
+        only to callbacks passed in that registration call, so the same
+        property, and even the same callback, can have multiple policies.
+
         .. note::
             For changes to ``ColumnDataSource.data`` made by ``stream()`` or
             ``patch()``, callbacks receive
@@ -566,7 +783,107 @@ class Model(HasProps, HasDocumentRef, PropertyCallbackManager, EventCallbackMana
 
         '''
         descriptor = self.lookup(attr)
+        policy = _callback_policy(self, descriptor.name, policy)
         super().on_change(descriptor.name, *callbacks)
+
+        registrations = self._callback_policies.setdefault(descriptor.name, [])
+        for callback in callbacks:
+            if not any(registered == callback and registered_policy == policy
+                    for registered, registered_policy in registrations):
+                registrations.append((callback, policy))
+        if policy != _IMMEDIATE_POLICY:
+            key = (descriptor.name, policy)
+            if key not in self._callback_policy_values:
+                self._callback_policy_values[key] = descriptor.get_value(self)
+        self._update_subscribed_changes(descriptor.name)
+
+    def remove_on_change(self, attr: str, *callbacks: PropertyCallback) -> None:
+        descriptor = self.lookup(attr)
+        super().remove_on_change(descriptor.name, *callbacks)
+        registrations = self._callback_policies.get(descriptor.name, [])
+        remaining = [
+            (registered, policy) for registered, policy in registrations
+            if registered not in callbacks
+        ]
+        if remaining:
+            self._callback_policies[descriptor.name] = remaining
+        else:
+            self._callback_policies.pop(descriptor.name, None)
+        self._update_subscribed_changes(descriptor.name)
+
+    def _update_subscribed_changes(self, attr: str) -> None:
+        changes = {name: list(policies) for name, policies in self.subscribed_changes.items()}
+        policies: list[tuple[str, float | None]] = []
+        for _, policy in self._callback_policies.get(attr, []):
+            if policy not in policies:
+                policies.append(policy)
+        if policies and policies != [_IMMEDIATE_POLICY]:
+            changes[attr] = policies
+        else:
+            changes.pop(attr, None)
+        for key in [key for key in self._callback_policy_values if key[0] == attr and key[1] not in policies]:
+            del self._callback_policy_values[key]
+        if changes:
+            self.subscribed_changes = changes
+        else:
+            del self.subscribed_changes
+
+    def _callbacks_for_change(self, attr: str, old: Any) -> tuple[list[PropertyCallback], Any] | None:
+        incoming = self._incoming_callback_policy
+        if incoming is None or incoming[0] != attr:
+            return None
+
+        _, incoming_policy, callback_old = incoming
+        self._incoming_callback_dispatched = True
+        callbacks = [
+            callback for callback, policy in self._callback_policies.get(attr, [])
+            if policy == incoming_policy
+        ]
+        return callbacks, callback_old
+
+    def _invoke_callbacks(self, callbacks: list[PropertyCallback], attr: str, old: Any, new: Any) -> None:
+        incoming = self._incoming_callback_policy
+        self._incoming_callback_policy = None
+        try:
+            super()._invoke_callbacks(callbacks, attr, old, new)
+        finally:
+            self._incoming_callback_policy = incoming
+
+    def _callback_policy_for_change(self, attr: str) -> _CallbackPolicy | None:
+        incoming = self._incoming_callback_policy
+        return incoming[1] if incoming is not None and incoming[0] == attr else None
+
+    def _set_from_json_with_callback_policy(self, attr: str, value: Any,
+            policy: _CallbackPolicy, *, setter: Setter | None = None) -> None:
+        descriptor = self.lookup(attr)
+        key = (descriptor.name, policy)
+        callback_old = self._callback_policy_values.get(key, descriptor.get_value(self))
+        self._incoming_callback_policy = (descriptor.name, policy, callback_old)
+        self._incoming_callback_dispatched = False
+        try:
+            self.set_from_json(descriptor.name, value, setter=setter)
+        finally:
+            self._incoming_callback_policy = None
+
+        physical_new = descriptor.get_value(self)
+        self._callback_policy_values[key] = physical_new
+        if not self._incoming_callback_dispatched:
+            callbacks = [
+                callback for callback, registered_policy in self._callback_policies.get(descriptor.name, [])
+                if registered_policy == policy
+            ]
+            if callbacks:
+                def invoke() -> None:
+                    self._invoke_callbacks(callbacks, descriptor.name, callback_old, physical_new)
+                if self.document is None:
+                    invoke()
+                else:
+                    from ..document.events import ModelChangedEvent
+                    event = ModelChangedEvent(
+                        self.document, self, descriptor.name, physical_new,
+                        setter, invoke, policy,
+                    )
+                    self.document.callbacks.trigger_on_change(event)
 
     def references(self) -> set[Model]:
         ''' Returns all ``Models`` that this object has references to.
@@ -679,6 +996,9 @@ class Model(HasProps, HasDocumentRef, PropertyCallbackManager, EventCallbackMana
         # chain up to invoke callbacks
         descriptor = self.lookup(attr)
         super().trigger(descriptor.name, old, new, hint=hint, setter=setter)
+        if self._incoming_callback_policy is None:
+            for _, policy in self._callback_policies.get(descriptor.name, []):
+                self._callback_policy_values[(descriptor.name, policy)] = new
 
     def _attach_document(self, doc: Document) -> None:
         ''' Attach a model to a Bokeh |Document|.

@@ -11,7 +11,9 @@ import {equals} from "core/util/eq"
 import {logger} from "./core/logging"
 import type {CallbackLike0} from "./core/util/callbacks"
 import {execute} from "./core/util/callbacks"
-import {Mapping, Str, List, Func} from "core/kinds"
+import {SyncPolicyQueue} from "./core/util/sync_policy"
+import type {SyncPolicy} from "./core/util/sync_policy"
+import {KeyVal, Mapping, Str, Float, List, Func, Enum, Null, Or, Tuple} from "core/kinds"
 
 export type ModelSelector<T extends HasProps> = HasPropsClass<T> | string | {type: string}
 
@@ -22,6 +24,18 @@ export type EventCallback<T extends ModelEvent = ModelEvent> = CallbackLike0<T>
 const JSCallbacks = Mapping(Str, List(Func<[], void>()))
 type JSCallbacks = typeof JSCallbacks["__type__"]
 
+export const CallbackPolicy = Or(
+  Tuple(Enum("immediate", "committed"), Null),
+  Tuple(Enum("throttle", "debounce"), Float),
+)
+export type CallbackPolicy = typeof CallbackPolicy["__type__"]
+
+const SubscribedChanges = KeyVal(Str, List(CallbackPolicy))
+type SubscribedChanges = typeof SubscribedChanges["__type__"]
+
+const JSCallbackPolicies = KeyVal(Str, KeyVal(Str, List(CallbackPolicy)))
+type JSCallbackPolicies = typeof JSCallbackPolicies["__type__"]
+
 export namespace Model {
   export type Attrs = p.AttrsOf<Props>
 
@@ -29,7 +43,9 @@ export namespace Model {
     tags: p.Property<unknown[]>
     name: p.Property<string | null>
     js_property_callbacks: p.Property<Dict<ChangeCallback[]>>
+    js_property_callback_policies: p.Property<JSCallbackPolicies>
     js_event_callbacks: p.Property<Dict<EventCallback[]>>
+    subscribed_changes: p.Property<SubscribedChanges>
     subscribed_events: p.Property<Set<string>>
     syncable: p.Property<boolean>
   } & Internal
@@ -44,6 +60,16 @@ export interface Model extends Model.Attrs {}
 export abstract class Model extends HasProps {
   declare properties: Model.Props
 
+  protected readonly _js_callback_queue = new SyncPolicyQueue<ChangeCallback>((callback) => {
+    void execute(callback, this)
+  })
+
+  protected readonly _sync_flush_listener = ({model, attr}: {model: Model, attr: string}) => {
+    if (model == this) {
+      this._js_callback_queue.flush(`change:${attr}\x00`)
+    }
+  }
+
   override get is_syncable(): boolean {
     return this.syncable
   }
@@ -57,7 +83,9 @@ export abstract class Model extends HasProps {
       tags:                  [ List(Unknown), [] ],
       name:                  [ Nullable(Str), null ],
       js_property_callbacks: [ Dict(List(Any /*TODO*/)), {} ],
+      js_property_callback_policies: [ JSCallbackPolicies, {} ],
       js_event_callbacks:    [ Dict(List(Any /*TODO*/)), {} ],
+      subscribed_changes:    [ SubscribedChanges, {} ],
       subscribed_events:     [ Set(Str), new globalThis.Set() ],
       syncable:              [ Bool, true ],
     }))
@@ -72,6 +100,7 @@ export abstract class Model extends HasProps {
 
     this._update_property_callbacks()
     this.connect(this.properties.js_property_callbacks.change, () => this._update_property_callbacks())
+    this.connect(this.properties.js_property_callback_policies.change, () => this._js_callback_queue.flush())
     this.connect(this.properties.js_event_callbacks.change, () => this._update_event_callbacks())
     this.connect(this.properties.subscribed_events.change, () => this._update_event_callbacks())
   }
@@ -102,6 +131,7 @@ export abstract class Model extends HasProps {
   }
 
   protected _update_property_callbacks(): void {
+    this._js_callback_queue.cancel()
     const signal_for = (event: string) => {
       const [evt, attr=null] = event.split(":")
       return attr != null ? (this.properties as any)[attr][evt] : (this as any)[evt]
@@ -116,7 +146,7 @@ export abstract class Model extends HasProps {
     this._js_callbacks.clear()
 
     for (const [event, callbacks] of dict(this.js_property_callbacks)) {
-      const wrappers = callbacks.map((cb) => () => execute(cb, this))
+      const wrappers = callbacks.length == 0 ? [] : [() => this._schedule_property_callbacks(event)]
       this._js_callbacks.set(event, wrappers)
       const signal = signal_for(event)
       for (const cb of wrappers) {
@@ -125,8 +155,45 @@ export abstract class Model extends HasProps {
     }
   }
 
+  protected _schedule_property_callbacks(event: string): void {
+    const [evt, attr=null] = event.split(":")
+    if (evt != "change" || attr == null) {
+      for (const callback of dict(this.js_property_callbacks).get(event) ?? []) {
+        void execute(callback, this)
+      }
+      return
+    }
+
+    const policies = dict(dict(this.js_property_callback_policies).get(event) ?? {})
+    for (const callback of dict(this.js_property_callbacks).get(event) ?? []) {
+      const id = callback instanceof HasProps ? callback.id : null
+      const callback_policies = (id != null ? policies.get(id) : null) ?? [["immediate", null] as CallbackPolicy]
+      for (const policy of callback_policies) {
+        if (policy[0] == "immediate") {
+          void execute(callback, this)
+        } else {
+          const key = `${event}\x00${id}\x00${policy[0]}\x00${policy[1] ?? ""}`
+          const deferred = this.document?.is_sync_deferred(this, attr) ?? false
+          const delivered = this._js_callback_queue.submit(key, policy as SyncPolicy, callback, deferred)
+          if (delivered != null) {
+            void execute(delivered, this)
+          }
+        }
+      }
+    }
+  }
+
+  has_callback_policy(attr: string, mode?: SyncPolicy[0]): boolean {
+    const python = dict(this.subscribed_changes).get(attr) ?? []
+    const js = [...dict(dict(this.js_property_callback_policies).get(`change:${attr}`) ?? {}).values()].flat()
+    const policies = [...python, ...js]
+    return mode == null ? policies.some(([kind]) => kind != "immediate") : policies.some(([kind]) => kind == mode)
+  }
+
   protected override _doc_attached(): void {
     super._doc_attached()
+
+    this.document!.sync_flush.connect(this._sync_flush_listener)
 
     if (this.js_event_callbacks.size != 0 || this.subscribed_events.size != 0) {
       this._update_event_callbacks()
@@ -135,6 +202,8 @@ export abstract class Model extends HasProps {
 
   protected override _doc_detached(): void {
     super._doc_detached()
+    this._js_callback_queue.cancel()
+    this.document?.sync_flush.disconnect(this._sync_flush_listener)
     this.document?.event_manager.subscribed_models.delete(this)
   }
 

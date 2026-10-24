@@ -224,7 +224,9 @@ describe("document/defs module", () => {
         "tags",
         "name",
         "js_property_callbacks",
+        "js_property_callback_policies",
         "js_event_callbacks",
+        "subscribed_changes",
         "subscribed_events",
         "syncable",
       ]

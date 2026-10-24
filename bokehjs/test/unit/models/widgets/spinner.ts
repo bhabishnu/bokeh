@@ -2,6 +2,7 @@ import {Spinner} from "@bokehjs/models/widgets"
 import {display} from "#framework/layouts"
 import {expect} from "#framework/assertions"
 import {delay} from "@bokehjs/core/util/defer"
+import {ModelChangedEvent} from "@bokehjs/document"
 
 async function mousedown_mouseup(element: Element): Promise<void> {
   const ev = new MouseEvent("mousedown")
@@ -31,6 +32,28 @@ describe("Spinner incrementing and decrementing", () => {
 
     await mousedown_mouseup(button)
     expect(input.value).to.be.equal("2.36")
+  })
+
+  it("should defer a committed callback during button interaction", async () => {
+    const subscribed_changes = new Map([["value", [["committed", null] as ["committed", null]]]])
+    const updates: string[] = []
+    const obj = Spinner.create({
+      value: 1, step: 1, subscribed_changes,
+    })
+    const {view} = await display(obj, [500, 400])
+    const document = obj.document!
+    document.on_change((event) => {
+      if (event instanceof ModelChangedEvent) {
+        const state = document.is_sync_deferred(obj, event.attr) ? "deferred" : "immediate"
+        updates.push(`${state}:${event.attr}`)
+      }
+    })
+    document.sync_flush.connect(({attr}) => updates.push(`flush:${attr}`))
+    const button = view.shadow_el.querySelector(".bk-spin-btn-up")!
+
+    await mousedown_mouseup(button)
+
+    expect(updates).to.be.equal(["deferred:value", "flush:value"])
   })
 
   it("value should be correct after decrementing with step", async () => {

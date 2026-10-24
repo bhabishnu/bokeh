@@ -1,7 +1,7 @@
 import type {API, PartialFormatter} from "nouislider"
 import noUiSlider from "nouislider"
 
-import * as p from "core/properties"
+import type * as p from "core/properties"
 import type {Color} from "core/types"
 import type {StyleSheetLike} from "core/dom"
 import {div, span, empty} from "core/dom"
@@ -148,8 +148,14 @@ export abstract class AbstractSliderView<T extends number | string> extends Orie
         tooltip.style.display = show ? "block" : ""
       }
 
-      this._noUiSlider.on("start", () => this._toggle_user_select(false))
-      this._noUiSlider.on("end",   () => this._toggle_user_select(true))
+      this._noUiSlider.on("start", () => {
+        this._begin_change()
+        this._toggle_user_select(false)
+      })
+      this._noUiSlider.on("end", () => {
+        this._toggle_user_select(true)
+        this.model.document?.request_sync_flush(this.model, "value")
+      })
 
       this._noUiSlider.on("start", (_, i) => toggle_tooltip(i, true))
       this._noUiSlider.on("end",   (_, i) => toggle_tooltip(i, false))
@@ -184,9 +190,23 @@ export abstract class AbstractSliderView<T extends number | string> extends Orie
     this.model.value = this._calc_from(values)
   }
 
+  protected _begin_change(): void {
+    if (this.model.has_callback_policy("value", "committed")) {
+      this.model.document?.begin_sync_deferral(this.model, "value")
+    }
+  }
+
   protected _change(values: number[]): void {
     const value = this._calc_from(values)
-    this.model.setv({value, value_throttled: value})
+    this.model.value = value
+    if (this.model.has_callback_policy("value")) {
+      this.model.document?.request_sync_flush(this.model, "value")
+    }
+  }
+
+  override remove(): void {
+    this.model.document?.request_sync_flush(this.model, "value")
+    super.remove()
   }
 }
 
@@ -197,7 +217,6 @@ export namespace AbstractSlider {
     title: p.Property<string | null>
     show_value: p.Property<boolean>
     value: p.Property<unknown>
-    value_throttled: p.Property<unknown>
     direction: p.Property<"ltr" | "rtl">
     tooltips: p.Property<boolean>
     bar_color: p.Property<Color>
@@ -216,7 +235,6 @@ export abstract class AbstractSlider<T extends number | string> extends Oriented
         title:           [ Nullable(Str), "" ],
         show_value:      [ Bool, true ],
         value:           [ Unknown ],
-        value_throttled: [ Unknown, p.unset, {readonly: true} ],
         direction:       [ Enum("ltr", "rtl"), "ltr" ],
         tooltips:        [ Bool, true ],
         bar_color:       [ Color, "#e6e6e6" ],

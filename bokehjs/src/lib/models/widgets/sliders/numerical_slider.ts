@@ -31,7 +31,6 @@ export namespace NumericalSlider {
 
   export type Props = BaseNumericalSlider.Props & {
     value: p.Property<number>
-    value_throttled: p.Property<number>
   }
 }
 
@@ -42,7 +41,6 @@ export abstract class NumericalSlider extends BaseNumericalSlider {
   declare __view_type__: NumericalSliderView
 
   declare value: number
-  declare value_throttled: number
 
   protected _clamp(value: number): number {
     const [lo, hi] = this._bounds()
@@ -50,29 +48,13 @@ export abstract class NumericalSlider extends BaseNumericalSlider {
   }
 
   protected _enforce_bounds(): void {
-    const {value, value_throttled} = this.properties
-    const changes: Partial<{value: number, value_throttled: number}> = {}
-
+    const {value} = this.properties
     if (!value.is_unset) {
-      const v = this.value
-      const clamped = this._clamp(v)
-      if (clamped != v) {
-        changes.value = clamped
+      const current = this.value
+      const clamped = this._clamp(current)
+      if (clamped != current) {
+        this.setv({value: clamped})
       }
-    }
-
-    if (!value_throttled.is_unset) {
-      const t = this.value_throttled
-      const clamped = this._clamp(t)
-      if (clamped != t) {
-        changes.value_throttled = clamped
-      }
-    } else if (changes.value != null) {
-      changes.value_throttled = changes.value
-    }
-
-    if (changes.value != null || changes.value_throttled != null) {
-      this.setv(changes)
     }
   }
 }
