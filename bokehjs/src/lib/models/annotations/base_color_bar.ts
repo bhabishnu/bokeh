@@ -115,8 +115,9 @@ export abstract class BaseColorBarView extends AnnotationView {
 
     const self = this
     const parent: any = {
+      // this view is the logical parent, so that e.g. its `ready` covers these views
       get parent() {
-        return self.parent
+        return self
       },
       get root() {
         return self.root
