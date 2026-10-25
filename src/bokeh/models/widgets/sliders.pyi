@@ -12,7 +12,10 @@ from typing import Sequence, Unpack
 
 # Bokeh imports
 from ..._types import Datetime, Percent
-from ...core.enums import OrientationType as Orientation, SliderAppearanceType as SliderAppearance
+from ...core.enums import (
+    OrientationType as Orientation,
+    SliderAppearanceType as SliderAppearance,
+)
 from ..formatters import TickFormatter
 from .widget import Widget, _WidgetInit
 
